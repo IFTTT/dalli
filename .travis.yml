@@ -2,15 +2,18 @@ language: ruby
 rvm:
   - 1.9.3
   - 2.0.0
-  - rbx-19mode
+  - 2.1.2
+  - rbx-2
   - jruby
 gemfile:
   - gemfiles/rails3.gemfile
   - gemfiles/rails4.gemfile
 matrix:
   allow_failures:
-    - rvm: rbx-19mode
-branches:
-  only:
-    - master
+    - rvm: rbx-2
 env: JRUBY_OPTS='--1.9'
+before_install:
+  - sudo apt-get -y remove memcached
+  - echo "yes" | sudo add-apt-repository ppa:travis-ci/memcached-sasl
+  - sudo apt-get update
+  - sudo apt-get install -y memcached=1.4.13-0ubuntu2+travis1

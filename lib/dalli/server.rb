@@ -32,7 +32,7 @@ module Dalli
     }
 
     def initialize(attribs, options = {})
-      (@hostname, @port, @weight) = attribs.split(':')
+      (@hostname, @port, @weight) = parse_hostname(attribs)
       @port ||= 11211
       @port = Integer(@port)
       @weight ||= 1
@@ -55,7 +55,7 @@ module Dalli
     # Chokepoint method for instrumentation
     def request(op, *args)
       verify_state
-      raise Dalli::NetworkError, "#{hostname}:#{port} is down: #{@error} #{@msg}" unless alive?
+      raise Dalli::NetworkError, "#{hostname}:#{port} is down: #{@error} #{@msg}. If you are sure it is running, ensure memcached version is > 1.4." unless alive?
       begin
         send(op, *args)
       rescue Dalli::NetworkError
@@ -66,6 +66,8 @@ module Dalli
         Dalli.logger.error ex.backtrace.join("\n\t")
         false
       rescue Dalli::DalliError
+        raise
+      rescue Timeout::Error
         raise
       rescue => ex
         Dalli.logger.error "Unexpected exception in Dalli: #{ex.class.name}: #{ex.message}"
@@ -146,7 +148,7 @@ module Dalli
 
       while buf.bytesize - pos >= 24
         header = buf.slice(pos, 24)
-        (key_length, _, body_length) = header.unpack(KV_HEADER)
+        (key_length, _, body_length, cas) = header.unpack(KV_HEADER)
 
         if key_length == 0
           # all done!
@@ -163,7 +165,7 @@ module Dalli
           pos = pos + 24 + body_length
 
           begin
-            values[key] = deserialize(value, flags)
+            values[key] = [deserialize(value, flags), cas]
           rescue DalliError
           end
 
@@ -268,66 +270,75 @@ module Dalli
 
     def set(key, value, ttl, cas, options)
       (value, flags) = serialize(key, value, options)
+      ttl = sanitize_ttl(ttl)
 
       guard_max_value(key, value) do
         req = [REQUEST, OPCODES[multi? ? :setq : :set], key.bytesize, 8, 0, 0, value.bytesize + key.bytesize + 8, 0, cas, flags, ttl, key, value].pack(FORMAT[:set])
         write(req)
-        generic_response unless multi?
+        cas_response unless multi?
       end
     end
 
     def add(key, value, ttl, options)
       (value, flags) = serialize(key, value, options)
+      ttl = sanitize_ttl(ttl)
 
       guard_max_value(key, value) do
         req = [REQUEST, OPCODES[multi? ? :addq : :add], key.bytesize, 8, 0, 0, value.bytesize + key.bytesize + 8, 0, 0, flags, ttl, key, value].pack(FORMAT[:add])
         write(req)
-        generic_response unless multi?
+        cas_response unless multi?
       end
     end
 
-    def replace(key, value, ttl, options)
+    def replace(key, value, ttl, cas, options)
       (value, flags) = serialize(key, value, options)
+      ttl = sanitize_ttl(ttl)
 
       guard_max_value(key, value) do
-        req = [REQUEST, OPCODES[multi? ? :replaceq : :replace], key.bytesize, 8, 0, 0, value.bytesize + key.bytesize + 8, 0, 0, flags, ttl, key, value].pack(FORMAT[:replace])
+        req = [REQUEST, OPCODES[multi? ? :replaceq : :replace], key.bytesize, 8, 0, 0, value.bytesize + key.bytesize + 8, 0, cas, flags, ttl, key, value].pack(FORMAT[:replace])
         write(req)
-        generic_response unless multi?
+        cas_response unless multi?
       end
     end
 
-    def delete(key)
-      req = [REQUEST, OPCODES[multi? ? :deleteq : :delete], key.bytesize, 0, 0, 0, key.bytesize, 0, 0, key].pack(FORMAT[:delete])
+    def delete(key, cas)
+      req = [REQUEST, OPCODES[multi? ? :deleteq : :delete], key.bytesize, 0, 0, 0, key.bytesize, 0, cas, key].pack(FORMAT[:delete])
       write(req)
       generic_response unless multi?
     end
 
-    def flush(ttl)
-      req = [REQUEST, OPCODES[:flush], 0, 4, 0, 0, 4, 0, 0, 0].pack(FORMAT[:flush])
+    def flush(delay)
+      req = [REQUEST, OPCODES[:flush], 0, 4, 0, 0, 4, 0, 0, delay].pack(FORMAT[:flush])
       write(req)
       generic_response
     end
 
-    def decr(key, count, ttl, default)
-      expiry = default ? ttl : 0xFFFFFFFF
+    def decr_incr(opcode, key, count, ttl, default)
+      expiry = default ? sanitize_ttl(ttl) : 0xFFFFFFFF
       default ||= 0
       (h, l) = split(count)
       (dh, dl) = split(default)
-      req = [REQUEST, OPCODES[:decr], key.bytesize, 20, 0, 0, key.bytesize + 20, 0, 0, h, l, dh, dl, expiry, key].pack(FORMAT[:decr])
+      req = [REQUEST, OPCODES[opcode], key.bytesize, 20, 0, 0, key.bytesize + 20, 0, 0, h, l, dh, dl, expiry, key].pack(FORMAT[opcode])
       write(req)
       body = generic_response
-      body ? longlong(*body.unpack('NN')) : body
+      body ? body.unpack('Q>').first : body
+    end
+
+    def decr(key, count, ttl, default)
+      decr_incr :decr, key, count, ttl, default
     end
 
     def incr(key, count, ttl, default)
-      expiry = default ? ttl : 0xFFFFFFFF
-      default ||= 0
-      (h, l) = split(count)
-      (dh, dl) = split(default)
-      req = [REQUEST, OPCODES[:incr], key.bytesize, 20, 0, 0, key.bytesize + 20, 0, 0, h, l, dh, dl, expiry, key].pack(FORMAT[:incr])
-      write(req)
-      body = generic_response
-      body ? longlong(*body.unpack('NN')) : body
+      decr_incr :incr, key, count, ttl, default
+    end
+
+    def write_append_prepend(opcode, key, value)
+      write_generic [REQUEST, OPCODES[opcode], key.bytesize, 0, 0, 0, value.bytesize + key.bytesize, 0, 0, key, value].pack(FORMAT[opcode])
+    end
+
+    def write_generic(bytes)
+      write(bytes)
+      generic_response
     end
 
     def write_noop
@@ -343,15 +354,11 @@ module Dalli
     end
 
     def append(key, value)
-      req = [REQUEST, OPCODES[:append], key.bytesize, 0, 0, 0, value.bytesize + key.bytesize, 0, 0, key, value].pack(FORMAT[:append])
-      write(req)
-      generic_response
+      write_append_prepend :append, key, value
     end
 
     def prepend(key, value)
-      req = [REQUEST, OPCODES[:prepend], key.bytesize, 0, 0, 0, value.bytesize + key.bytesize, 0, 0, key, value].pack(FORMAT[:prepend])
-      write(req)
-      generic_response
+      write_append_prepend :prepend, key, value
     end
 
     def stats(info='')
@@ -361,27 +368,22 @@ module Dalli
     end
 
     def reset_stats
-      req = [REQUEST, OPCODES[:stat], 'reset'.bytesize, 0, 0, 0, 'reset'.bytesize, 0, 0, 'reset'].pack(FORMAT[:stat])
-      write(req)
-      generic_response
+      write_generic [REQUEST, OPCODES[:stat], 'reset'.bytesize, 0, 0, 0, 'reset'.bytesize, 0, 0, 'reset'].pack(FORMAT[:stat])
     end
 
     def cas(key)
       req = [REQUEST, OPCODES[:get], key.bytesize, 0, 0, 0, key.bytesize, 0, 0, key].pack(FORMAT[:get])
       write(req)
-      cas_response
+      data_cas_response
     end
 
     def version
-      req = [REQUEST, OPCODES[:version], 0, 0, 0, 0, 0, 0, 0].pack(FORMAT[:noop])
-      write(req)
-      generic_response
+      write_generic [REQUEST, OPCODES[:version], 0, 0, 0, 0, 0, 0, 0].pack(FORMAT[:noop])
     end
 
     def touch(key, ttl)
-      req = [REQUEST, OPCODES[:touch], key.bytesize, 4, 0, 0, key.bytesize + 4, 0, 0, ttl, key].pack(FORMAT[:touch])
-      write(req)
-      generic_response
+      ttl = sanitize_ttl(ttl)
+      write_generic [REQUEST, OPCODES[:touch], key.bytesize, 4, 0, 0, key.bytesize + 4, 0, 0, ttl, key].pack(FORMAT[:touch])
     end
 
     # http://www.hjp.at/zettel/m/memcached_flags.rxml
@@ -396,6 +398,8 @@ module Dalli
         marshalled = true
         begin
           self.serializer.dump(value)
+        rescue TimeoutError => e
+          raise e
         rescue => ex
           # Marshalling can throw several different types of generic Ruby exceptions.
           # Convert to a specific exception so we can special case it higher up the stack.
@@ -433,10 +437,8 @@ module Dalli
       raise UnmarshalError, "Unable to uncompress value: #{$!.message}"
     end
 
-    def cas_response
-      header = read(24)
-      raise Dalli::NetworkError, 'No response' if !header
-      (extras, _, status, count, _, cas) = header.unpack(CAS_HEADER)
+    def data_cas_response
+      (extras, _, status, count, _, cas) = read_header.unpack(CAS_HEADER)
       data = read(count) if count > 0
       if status == 1
         nil
@@ -452,7 +454,7 @@ module Dalli
 
     CAS_HEADER = '@4CCnNNQ'
     NORMAL_HEADER = '@4CCnN'
-    KV_HEADER = '@2n@6nN'
+    KV_HEADER = '@2n@6nN@16Q'
 
     def guard_max_value(key, value)
       if value.bytesize <= @options[:value_max_bytes]
@@ -463,10 +465,20 @@ module Dalli
       end
     end
 
+    # https://code.google.com/p/memcached/wiki/NewCommands#Standard_Protocol
+    # > An expiration time, in seconds. Can be up to 30 days. After 30 days, is treated as a unix timestamp of an exact date.
+    MAX_ACCEPTABLE_EXPIRATION_INTERVAL = 30*24*60*60 # 30 days
+    def sanitize_ttl(ttl)
+      if ttl > MAX_ACCEPTABLE_EXPIRATION_INTERVAL
+        Dalli.logger.debug "Expiration interval too long for Memcached, converting to an expiration timestamp"
+        Time.now.to_i + ttl.to_i
+      else
+        ttl.to_i
+      end
+    end
+
     def generic_response(unpack=false)
-      header = read(24)
-      raise Dalli::NetworkError, 'No response' if !header
-      (extras, _, status, count) = header.unpack(NORMAL_HEADER)
+      (extras, _, status, count) = read_header.unpack(NORMAL_HEADER)
       data = read(count) if count > 0
       if status == 1
         nil
@@ -483,12 +495,24 @@ module Dalli
       end
     end
 
+    def cas_response
+      (_, _, status, count, _, cas) = read_header.unpack(CAS_HEADER)
+      read(count) if count > 0  # this is potential data that we don't care about
+      if status == 1
+        nil
+      elsif status == 2 || status == 5
+        false # Not stored, normal status for add operation
+      elsif status != 0
+        raise Dalli::DalliError, "Response error #{status}: #{RESPONSE_CODES[status]}"
+      else
+        cas
+      end
+    end
+
     def keyvalue_response
       hash = {}
       loop do
-        header = read(24)
-        raise Dalli::NetworkError, 'No response' if !header
-        (key_length, _, body_length) = header.unpack(KV_HEADER)
+        (key_length, _, body_length, _) = read_header.unpack(KV_HEADER)
         return hash if key_length == 0
         key = read(key_length)
         value = read(body_length - key_length) if body_length - key_length > 0
@@ -499,9 +523,7 @@ module Dalli
     def multi_response
       hash = {}
       loop do
-        header = read(24)
-        raise Dalli::NetworkError, 'No response' if !header
-        (key_length, _, body_length) = header.unpack(KV_HEADER)
+        (key_length, _, body_length, _) = read_header.unpack(KV_HEADER)
         return hash if key_length == 0
         flags = read(4).unpack('N')[0]
         key = read(key_length)
@@ -532,14 +554,18 @@ module Dalli
       end
     end
 
+    def read_header
+      read(24) || raise(Dalli::NetworkError, 'No response')
+    end
+
     def connect
       Dalli.logger.debug { "Dalli::Server#connect #{hostname}:#{port}" }
 
       begin
         @pid = Process.pid
         @sock = KSocket.open(hostname, port, self, options)
-        @version = version # trigger actual connect
         sasl_authentication if need_auth?
+        @version = version # trigger actual connect
         up!
       rescue Dalli::DalliError # SASL auth failure
         raise
@@ -551,10 +577,6 @@ module Dalli
 
     def split(n)
       [n >> 32, 0xFFFFFFFF & n]
-    end
-
-    def longlong(a, b)
-      (a << 32) | b
     end
 
     REQUEST = 0x80
@@ -645,11 +667,10 @@ module Dalli
       # negotiate
       req = [REQUEST, OPCODES[:auth_negotiation], 0, 0, 0, 0, 0, 0, 0].pack(FORMAT[:noop])
       write(req)
-      header = read(24)
-      raise Dalli::NetworkError, 'No response' if !header
-      (extras, type, status, count) = header.unpack(NORMAL_HEADER)
+
+      (extras, type, status, count) = read_header.unpack(NORMAL_HEADER)
       raise Dalli::NetworkError, "Unexpected message format: #{extras} #{count}" unless extras == 0 && count > 0
-      content = read(count)
+      content = read(count).gsub(/\u0000/, ' ')
       return (Dalli.logger.debug("Authentication not required/supported by server")) if status == 0x81
       mechanisms = content.split(' ')
       raise NotImplementedError, "Dalli only supports the PLAIN authentication mechanism" if !mechanisms.include?('PLAIN')
@@ -660,9 +681,7 @@ module Dalli
       req = [REQUEST, OPCODES[:auth_request], mechanism.bytesize, 0, 0, 0, mechanism.bytesize + msg.bytesize, 0, 0, mechanism, msg].pack(FORMAT[:auth_request])
       write(req)
 
-      header = read(24)
-      raise Dalli::NetworkError, 'No response' if !header
-      (extras, type, status, count) = header.unpack(NORMAL_HEADER)
+      (extras, type, status, count) = read_header.unpack(NORMAL_HEADER)
       raise Dalli::NetworkError, "Unexpected message format: #{extras} #{count}" unless extras == 0 && count > 0
       content = read(count)
       return Dalli.logger.info("Dalli/SASL: #{content}") if status == 0
@@ -671,6 +690,11 @@ module Dalli
       raise NotImplementedError, "No two-step authentication mechanisms supported"
       # (step, msg) = sasl.receive('challenge', content)
       # raise Dalli::NetworkError, "Authentication failed" if sasl.failed? || step != 'response'
+    end
+
+    def parse_hostname(str)
+      res = str.match(/\A(\[([\h:]+)\]|[^:]+)(:(\d+))?(:(\d+))?\z/)
+      return res[2] || res[1], res[4], res[6]
     end
   end
 end

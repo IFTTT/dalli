@@ -35,8 +35,7 @@ Supported Ruby versions and implementations
 Dalli should work identically on:
 
  * JRuby 1.6+
- * Ruby 1.9.2+
- * Ruby 1.8.7+
+ * Ruby 1.9.3+
  * Rubinius 2.0
 
 If you have problems, please enter an issue.
@@ -45,7 +44,7 @@ If you have problems, please enter an issue.
 Installation and Usage
 ------------------------
 
-Remember, Dalli **requires** memcached 1.4+. You can check the version with `memcached -h`. Please note that memcached that Mac OS X Snow Leopard ships with is 1.2.8 and won't work. Install 1.4.x using Homebrew with
+Remember, Dalli **requires** memcached 1.4+. You can check the version with `memcached -h`. Please note that the memcached version that *Mac OS X Snow Leopard* ships with is 1.2.8 and it won't work. Install memcached 1.4.x using Homebrew with
 
     brew install memcached
 
@@ -73,7 +72,7 @@ Dalli has no runtime dependencies and never will.  You can optionally install th
 give Dalli a 20-30% performance boost.
 
 
-Usage with Rails 3.x
+Usage with Rails 3.x and 4.x
 ---------------------------
 
 In your Gemfile:
@@ -95,6 +94,12 @@ config.cache_store = :dalli_store, 'cache-1.example.com', 'cache-2.example.com',
   { :namespace => NAME_OF_RAILS_APP, :expires_in => 1.day, :compress => true }
 ```
 
+If your servers are specified in `ENV["MEMCACHE_SERVERS"]` (e.g. on Heroku when using a third-party hosted addon), simply provide `nil` for the servers:
+
+```ruby
+config.cache_store = :dalli_store, nil, { :namespace => NAME_OF_RAILS_APP, :expires_in => 1.day, :compress => true }
+```
+
 To use Dalli for Rails session storage that times out after 20 minutes, in `config/initializers/session_store.rb`:
 
 For Rails >= 3.2.4:
@@ -113,22 +118,59 @@ Rails.application.config.session_store :dalli_store, :memcache_server => ['host1
 Dalli does not support Rails 2.x.
 
 
+Multithreading and Rails
+--------------------------
+
+If you use Puma or another threaded app server, as of Dalli 2.7, you can use a pool
+of Dalli clients with Rails to ensure the `Rails.cache` singleton does not become a
+source of thread contention.  You must add `gem 'connection_pool'` to your Gemfile and
+add :pool\_size to your `dalli_store` config:
+
+```ruby
+config.cache_store = :dalli_store, 'cache-1.example.com', { :pool_size => 5 }
+```
+
+You can then use the Rails cache as normal and Rails.cache will use the pool transparently under the covers, or you can check out a Dalli client directly from the pool:
+
+```ruby
+Rails.cache.fetch('foo', :expires_in => 300) do
+  'bar'
+end
+
+Rails.cache.dalli.with do |client|
+  # client is a Dalli::Client instance which you can
+  # use ONLY within this block
+end
+```
+
+
 Configuration
 ------------------------
+
 Dalli::Client accepts the following options. All times are in seconds.
 
 **expires_in**: Global default for key TTL.  Default is 0, which means no expiry.
 
-**failover**: Boolean, if true Dalli will failover to another server if the main server for a key is down.
+**namespace**: If specified, prepends each key with this value to provide simple namespacing.  Default is nil.
 
-**compress**: Boolean, if true Dalli will gzip-compress values larger than 1K.
+**failover**: Boolean, if true Dalli will failover to another server if the main server for a key is down.  Default is true.
+
+**threadsafe**: Boolean.  If true Dalli ensures that only one thread is using a socket at a given time.  Default is true.  Set to false at your own peril.
+
+**serializer**: The serializer to use for objects being stored (ex. JSON).
+Default is Marshal.
+
+**compress**: Boolean, if true Dalli will gzip-compress values larger than 1K. Default is false.
 
 **compression_min_size**: Minimum value byte size for which to attempt compression. Default is 1K.
 
 **compression_max_size**: Maximum value byte size for which to attempt compression. Default is unlimited.
 
-**serializer**: The serializer to use for objects being stored (ex. JSON).
-Default is Marshal.
+**compressor**: The compressor to use for objects being stored.
+Default is zlib, implemented under `Dalli::Compressor`.
+If serving compressed data using nginx's HttpMemcachedModule, set `memcached_gzip_flag 2` and use `Dalli::GzipCompressor`
+
+**keepalive**: Boolean. If true, Dalli will enable keep-alive for socket connections.  Default is true.
 
 **socket_timeout**: Timeout for all socket operations (connect, read, write). Default is 0.5.
 
@@ -136,19 +178,13 @@ Default is Marshal.
 
 **socket_failure_delay**: Before retrying a socket operation, the process sleeps for this amount of time. Default is 0.01.  Set to nil for no delay.
 
-**down_retry_delay**: When a server has been marked down due to many failures, the server will be checked again for being alive only after this amount of time. Don't set this value to low, otherwise each request which tries the failed server might hang for the maximum **socket_timeout**. Default is 1 second.
+**down_retry_delay**: When a server has been marked down due to many failures, the server will be checked again for being alive only after this amount of time. Don't set this value too low, otherwise each request which tries the failed server might hang for the maximum **socket_timeout**. Default is 1 second.
 
 **value_max_bytes**: The maximum size of a value in memcached.  Defaults to 1MB, this can be increased with memcached's -I parameter.  You must also configure Dalli to allow the larger size here.
 
 **username**: The username to use for authenticating this client instance against a SASL-enabled memcached server.  Heroku users should not need to use this normally.
 
 **password**: The password to use for authenticating this client instance against a SASL-enabled memcached server.  Heroku users should not need to use this normally.
-
-**keepalive**: Boolean. If true, Dalli will enable keep-alive for socket connections.  Default is true.
-
-**compressor**: The compressor to use for objects being stored.
-Default is zlib, implemented under `Dalli::Compressor`.
-If serving compressed data using nginx's HttpMemcachedModule, set `memcached_gzip_flag 2` and use `Dalli::GzipCompressor`
 
 Features and Changes
 ------------------------
@@ -168,12 +204,12 @@ Helping Out
 
 If you have a fix you wish to provide, please fork the code, fix in your local project and then send a pull request on github.  Please ensure that you include a test which verifies your fix and update History.md with a one sentence description of your fix so you get credit as a contributor.
 
-We're not accepting new compressors. They are trivial to add. See #385 (LZ4), #406 (Snappy)
+We're not accepting new compressors. They are trivial to add in an initializer. See #385 (LZ4), #406 (Snappy)
 
 Thanks
 ------------
 
-Eric Wong - for help using his [kgio](http://unicorn.bogomips.org/kgio/index.html) library.
+Eric Wong - for help using his [kgio](http://bogomips.org/kgio/) library.
 
 Brian Mitchell - for his remix-stash project which was helpful when implementing and testing the binary protocol support.
 
@@ -183,12 +219,10 @@ Brian Mitchell - for his remix-stash project which was helpful when implementing
 Author
 ----------
 
-Mike Perham, mperham@gmail.com, [mikeperham.com](http://mikeperham.com), [@mperham](http://twitter.com/mperham)  If you like and use this project, please give me a recommendation at [WWR](http://workingwithrails.com/person/10797-mike-perham) or send a few bucks my way via my Pledgie page below.  Happy caching!
-
-<a href='http://www.pledgie.com/campaigns/16623'><img alt='Click here to lend your support to Open Source and make a donation at www.pledgie.com !'     src='http://www.pledgie.com/campaigns/16623.png?skin_name=chrome' border='0' /></a>
+Mike Perham, [mikeperham.com](http://mikeperham.com), [@mperham](http://twitter.com/mperham)
 
 
 Copyright
 -----------
 
-Copyright (c) 2012 Mike Perham. See LICENSE for details.
+Copyright (c) Mike Perham. See LICENSE for details.

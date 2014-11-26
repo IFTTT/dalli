@@ -1,5 +1,6 @@
 # encoding: utf-8
 require 'helper'
+require 'connection_pool'
 
 class MockUser
   def cache_key
@@ -8,40 +9,48 @@ class MockUser
 end
 
 describe 'ActiveSupport' do
+  before do
+    @port = 19987
+  end
+
   describe 'active_support caching' do
 
     it 'has accessible options' do
-      @dalli = ActiveSupport::Cache.lookup_store(:dalli_store, 'localhost:19122', :expires_in => 5.minutes, :frob => 'baz')
+      @dalli = ActiveSupport::Cache.lookup_store(:dalli_store, "localhost:#{@port}", :expires_in => 5.minutes, :frob => 'baz')
       assert_equal 'baz', @dalli.options[:frob]
     end
 
     it 'allow mute and silence' do
-      @dalli = ActiveSupport::Cache.lookup_store(:dalli_store, 'localhost:19122')
-      @dalli.mute do
-        assert_equal true, @dalli.write('foo', 'bar', nil)
-        assert_equal 'bar', @dalli.read('foo', nil)
+      memcached_persistent(@port) do
+        @dalli = ActiveSupport::Cache.lookup_store(:dalli_store, "localhost:#{@port}")
+        @dalli.mute do
+          assert op_addset_succeeds(@dalli.write('foo', 'bar', nil))
+          assert_equal 'bar', @dalli.read('foo', nil)
+        end
+        refute @dalli.silence?
+        @dalli.silence!
+        assert_equal true, @dalli.silence?
       end
-      refute @dalli.silence?
-      @dalli.silence!
-      assert_equal true, @dalli.silence?
     end
 
     it 'handle nil options' do
-      @dalli = ActiveSupport::Cache.lookup_store(:dalli_store, 'localhost:19122')
-      assert_equal true, @dalli.write('foo', 'bar', nil)
-      assert_equal 'bar', @dalli.read('foo', nil)
-      assert_equal 18, @dalli.fetch('lkjsadlfk', nil) { 18 }
-      assert_equal 18, @dalli.fetch('lkjsadlfk', nil) { 18 }
-      assert_equal 1, @dalli.increment('lkjsa', 1, nil)
-      assert_equal 2, @dalli.increment('lkjsa', 1, nil)
-      assert_equal 1, @dalli.decrement('lkjsa', 1, nil)
-      assert_equal true, @dalli.delete('lkjsa')
+      memcached_persistent(@port) do
+        @dalli = ActiveSupport::Cache.lookup_store(:dalli_store, "localhost:#{@port}")
+        assert op_addset_succeeds(@dalli.write('foo', 'bar', nil))
+        assert_equal 'bar', @dalli.read('foo', nil)
+        assert_equal 18, @dalli.fetch('lkjsadlfk', nil) { 18 }
+        assert_equal 18, @dalli.fetch('lkjsadlfk', nil) { 18 }
+        assert_equal 1, @dalli.increment('lkjsa', 1, nil)
+        assert_equal 2, @dalli.increment('lkjsa', 1, nil)
+        assert_equal 1, @dalli.decrement('lkjsa', 1, nil)
+        assert_equal true, @dalli.delete('lkjsa')
+      end
     end
 
     it 'support fetch' do
       with_activesupport do
-        memcached do
-          connect
+        memcached_persistent(@port) do
+          connect(@port)
           dvalue = @dalli.fetch('someotherkeywithoutspaces', :expires_in => 1.second) { 123 }
           assert_equal 123, dvalue
 
@@ -67,8 +76,8 @@ describe 'ActiveSupport' do
 
     it 'support keys with spaces on Rails3' do
       with_activesupport do
-        memcached do
-          connect
+        memcached_persistent(@port) do
+          connect(@port)
           dvalue = @dalli.fetch('some key with spaces', :expires_in => 1.second) { 123 }
           assert_equal 123, dvalue
         end
@@ -77,8 +86,8 @@ describe 'ActiveSupport' do
 
     it 'support read_multi' do
       with_activesupport do
-        memcached do
-          connect
+        memcached_persistent(@port) do
+          connect(@port)
           x = rand_key
           y = rand_key
           assert_equal({}, @dalli.read_multi(x, y))
@@ -91,8 +100,8 @@ describe 'ActiveSupport' do
 
     it 'support read_multi with an array' do
       with_activesupport do
-        memcached do
-          connect
+        memcached_persistent(@port) do
+          connect(@port)
           x = rand_key
           y = rand_key
           assert_equal({}, @dalli.read_multi([x, y]))
@@ -107,8 +116,8 @@ describe 'ActiveSupport' do
 
     it 'support raw read_multi' do
       with_activesupport do
-        memcached do
-          connect
+        memcached_persistent(@port) do
+          connect(@port)
           @dalli.write("abc", 5, :raw => true)
           @dalli.write("cba", 5, :raw => true)
           assert_equal({'abc' => '5', 'cba' => '5' }, @dalli.read_multi("abc", "cba"))
@@ -118,8 +127,8 @@ describe 'ActiveSupport' do
 
     it 'support read_multi with LocalCache' do
       with_activesupport do
-        memcached do
-          connect
+        memcached_persistent(@port) do
+          connect(@port)
           x = rand_key
           y = rand_key
           assert_equal({}, @dalli.read_multi(x, y))
@@ -149,8 +158,8 @@ describe 'ActiveSupport' do
 
     it 'supports fetch_multi' do
       with_activesupport do
-        memcached do
-          connect
+        memcached_persistent(@port) do
+          connect(@port)
 
           x = rand_key.to_s
           y = rand_key
@@ -169,12 +178,12 @@ describe 'ActiveSupport' do
 
     it 'support read, write and delete' do
       with_activesupport do
-        memcached do
-          connect
+        memcached_persistent(@port) do
+          connect(@port)
           y = rand_key
           assert_nil @dalli.read(y)
           dres = @dalli.write(y, 123)
-          assert_equal true, dres
+          assert op_addset_succeeds(dres)
 
           dres = @dalli.read(y)
           assert_equal 123, dres
@@ -184,7 +193,7 @@ describe 'ActiveSupport' do
 
           user = MockUser.new
           dres = @dalli.write(user.cache_key, "foo")
-          assert_equal true, dres
+          assert op_addset_succeeds(dres)
 
           dres = @dalli.read(user)
           assert_equal "foo", dres
@@ -200,10 +209,55 @@ describe 'ActiveSupport' do
       end
     end
 
+    it 'support read, write and delete with local namespace' do
+      with_activesupport do
+        memcached_persistent(@port) do
+          connect(@port, '')
+          key = 'key_with_namespace'
+          namespace_value = @dalli.fetch(key, :namespace => 'namespace') { 123 }
+          assert_equal 123, namespace_value
+
+          res = @dalli.read(key, :namespace => 'namespace')
+          assert_equal 123, res
+
+          res = @dalli.delete(key, :namespace => 'namespace')
+          assert_equal true, res
+
+          res = @dalli.write(key, "foo", :namespace => 'namespace')
+          assert op_addset_succeeds(res)
+
+          res = @dalli.read(key, :namespace => 'namespace')
+          assert_equal "foo", res
+        end
+      end
+    end
+
+    it 'support multi_read and multi_fetch with local namespace' do
+      with_activesupport do
+        memcached_persistent(@port) do
+          connect(@port, '')
+          x         = rand_key.to_s
+          y         = rand_key
+          namespace = 'namespace'
+          hash      = { x => 'ABC', y => 'DEF' }
+
+          results = @dalli.fetch_multi(x, y, :namespace => namespace) { |key| hash[key] }
+
+          assert_equal({ x => 'ABC', y => 'DEF' }, results)
+          assert_equal('ABC', @dalli.read(x, :namespace => namespace))
+          assert_equal('DEF', @dalli.read(y, :namespace => namespace))
+
+          @dalli.write("abc", 5, :namespace => 'namespace')
+          @dalli.write("cba", 5, :namespace => 'namespace')
+          assert_equal({'abc' => 5, 'cba' => 5 }, @dalli.read_multi("abc", "cba", :namespace => 'namespace'))
+        end
+      end
+    end
+
     it 'support read, write and delete with LocalCache' do
       with_activesupport do
-        memcached do
-          connect
+        memcached_persistent(@port) do
+          connect(@port)
           y = rand_key.to_s
           @dalli.with_local_cache do
             Dalli::Client.any_instance.expects(:get).with(y, {}).once.returns(123)
@@ -230,8 +284,8 @@ describe 'ActiveSupport' do
 
     it 'support unless_exist with LocalCache' do
       with_activesupport do
-        memcached do
-          connect
+        memcached_persistent(@port) do
+          connect(@port)
           y = rand_key.to_s
           @dalli.with_local_cache do
             Dalli::Client.any_instance.expects(:add).with(y, 123, nil, {:unless_exist => true}).once.returns(true)
@@ -254,9 +308,9 @@ describe 'ActiveSupport' do
 
     it 'support increment/decrement commands' do
       with_activesupport do
-        memcached do
-          connect
-          assert_equal true, @dalli.write('counter', 0, :raw => true)
+        memcached_persistent(@port) do
+          connect(@port)
+          assert op_addset_succeeds(@dalli.write('counter', 0, :raw => true))
           assert_equal 1, @dalli.increment('counter')
           assert_equal 2, @dalli.increment('counter')
           assert_equal 1, @dalli.decrement('counter')
@@ -281,7 +335,7 @@ describe 'ActiveSupport' do
           assert_equal nil, @dalli.read('counterZ2')
 
           user = MockUser.new
-          assert_equal true, @dalli.write(user, 0, :raw => true)
+          assert op_addset_succeeds(@dalli.write(user, 0, :raw => true))
           assert_equal 1, @dalli.increment(user)
           assert_equal 2, @dalli.increment(user)
           assert_equal 1, @dalli.decrement(user)
@@ -292,8 +346,8 @@ describe 'ActiveSupport' do
 
     it 'support exist command' do
       with_activesupport do
-        memcached do
-          connect
+        memcached_persistent(@port) do
+          connect(@port)
           @dalli.write(:foo, 'a')
           @dalli.write(:false_value, false)
 
@@ -311,8 +365,8 @@ describe 'ActiveSupport' do
 
     it 'support other esoteric commands' do
       with_activesupport do
-        memcached do
-          connect
+        memcached_persistent(@port) do
+          connect(@port)
           ds = @dalli.stats
           assert_equal 1, ds.keys.size
           assert ds[ds.keys.first].keys.size > 0
@@ -324,16 +378,17 @@ describe 'ActiveSupport' do
 
     it 'respect "raise_errors" option' do
       with_activesupport do
-        memcached(29125) do
-          @dalli = ActiveSupport::Cache.lookup_store(:dalli_store, 'localhost:29125')
+        new_port = 29333
+        memcached_persistent(new_port) do
+          @dalli = ActiveSupport::Cache.lookup_store(:dalli_store, "localhost:#{new_port}")
           @dalli.write 'foo', 'bar'
           assert_equal @dalli.read('foo'), 'bar'
 
-          memcached_kill(29125)
+          memcached_kill(new_port)
 
           assert_equal @dalli.read('foo'), nil
 
-          @dalli = ActiveSupport::Cache.lookup_store(:dalli_store, 'localhost:29125', :raise_errors => true)
+          @dalli = ActiveSupport::Cache.lookup_store(:dalli_store, "localhost:#{new_port}", :raise_errors => true)
 
           exception = [Dalli::RingError, { :message => "No server available" }]
 
@@ -354,11 +409,11 @@ describe 'ActiveSupport' do
 
   it 'handle crazy characters from far-away lands' do
     with_activesupport do
-      memcached do
-        connect
+      memcached_persistent(@port) do
+        connect(@port)
         key = "fooƒ"
         value = 'bafƒ'
-        assert_equal true, @dalli.write(key, value)
+        assert op_addset_succeeds(@dalli.write(key, value))
         assert_equal value, @dalli.read(key)
       end
     end
@@ -366,40 +421,69 @@ describe 'ActiveSupport' do
 
   it 'normalize options as expected' do
     with_activesupport do
-      memcached do
-        @dalli = ActiveSupport::Cache::DalliStore.new('localhost:19122', :expires_in => 1, :namespace => 'foo', :compress => true)
+      memcached_persistent(@port) do
+        @dalli = ActiveSupport::Cache::DalliStore.new("localhost:#{@port}", :expires_in => 1, :namespace => 'foo', :compress => true)
         assert_equal 1, @dalli.instance_variable_get(:@data).instance_variable_get(:@options)[:expires_in]
         assert_equal 'foo', @dalli.instance_variable_get(:@data).instance_variable_get(:@options)[:namespace]
+        assert_equal ["localhost:#{@port}"], @dalli.instance_variable_get(:@data).instance_variable_get(:@servers)
+      end
+    end
+  end
+
+  it 'handles nil server with additional options' do
+    with_activesupport do
+      memcached_persistent(@port) do
+        @dalli = ActiveSupport::Cache::DalliStore.new(nil, :expires_in => 1, :namespace => 'foo', :compress => true)
+        assert_equal 1, @dalli.instance_variable_get(:@data).instance_variable_get(:@options)[:expires_in]
+        assert_equal 'foo', @dalli.instance_variable_get(:@data).instance_variable_get(:@options)[:namespace]
+        assert_equal ["127.0.0.1:11211"], @dalli.instance_variable_get(:@data).instance_variable_get(:@servers)
+      end
+    end
+  end
+
+  it 'supports connection pooling' do
+    with_activesupport do
+      memcached_persistent(@port) do
+        @dalli = ActiveSupport::Cache::DalliStore.new("localhost:#{@port}", :expires_in => 1, :namespace => 'foo', :compress => true, :pool_size => 3)
+        assert_equal nil, @dalli.read('foo')
+        assert @dalli.write('foo', 1)
+        assert_equal 1, @dalli.fetch('foo') { raise 'boom' }
+        assert_equal true, @dalli.dalli.is_a?(ConnectionPool)
+        assert_equal 1, @dalli.increment('bar')
+        assert_equal 0, @dalli.decrement('bar')
+        assert_equal true, @dalli.delete('bar')
+        assert_equal [true], @dalli.clear
+        assert_equal 1, @dalli.stats.size
       end
     end
   end
 
   it 'allow keys to be frozen' do
     with_activesupport do
-      memcached do
-        connect
+      memcached_persistent(@port) do
+        connect(@port)
         key = "foo"
         key.freeze
-        assert_equal true, @dalli.write(key, "value")
+        assert op_addset_succeeds(@dalli.write(key, "value"))
       end
     end
   end
 
   it 'allow keys from a hash' do
     with_activesupport do
-      memcached do
-        connect
+      memcached_persistent(@port) do
+        connect(@port)
         map = { "one" => "one", "two" => "two" }
         map.each_pair do |k, v|
-          assert_equal true, @dalli.write(k, v)
+          assert op_addset_succeeds(@dalli.write(k, v))
         end
         assert_equal map, @dalli.read_multi(*(map.keys))
       end
     end
   end
 
-  def connect
-    @dalli = ActiveSupport::Cache.lookup_store(:dalli_store, 'localhost:19122', :expires_in => 10.seconds, :namespace => lambda{33.to_s(36)})
+  def connect(port = 19122, namespace = lambda{33.to_s(36)})
+    @dalli = ActiveSupport::Cache.lookup_store(:dalli_store, "localhost:#{port}", :expires_in => 10.seconds, :namespace => namespace)
     @dalli.clear
   end
 

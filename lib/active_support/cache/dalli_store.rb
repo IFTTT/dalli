@@ -33,37 +33,62 @@ module ActiveSupport
       # If no addresses are specified, then DalliStore will connect to
       # localhost port 11211 (the default memcached port).
       #
+      # Connection Pool support
+      #
+      # If you are using multithreaded Rails, the Rails.cache singleton can become a source
+      # of contention.  You can use a connection pool of Dalli clients with Rails.cache by
+      # passing :pool_size and/or :pool_timeout:
+      #
+      # config.cache_store = :dalli_store, 'localhost:11211', :pool_size => 10
+      #
+      # Both pool options default to 5.  You must include the `connection_pool` gem if you
+      # wish to use pool support.
+      #
       def initialize(*addresses)
         addresses = addresses.flatten
         options = addresses.extract_options!
         @options = options.dup
+
+        pool_options = {}
+        pool_options[:size] = options[:pool_size] if options[:pool_size]
+        pool_options[:timeout] = options[:pool_timeout] if options[:pool_timeout]
+
         @options[:compress] ||= @options[:compression]
-        @raise_errors = !!@options[:raise_errors]
+
+        addresses.compact!
         servers = if addresses.empty?
                     nil # use the default from Dalli::Client
                   else
                     addresses
                   end
-        @data = Dalli::Client.new(servers, @options)
+        if pool_options.empty?
+          @data = Dalli::Client.new(servers, @options)
+        else
+          @data = ::ConnectionPool.new(pool_options) { Dalli::Client.new(servers, @options.merge(:threadsafe => false)) }
+        end
 
         extend Strategy::LocalCache
       end
 
       ##
-      # Access the underlying Dalli::Client instance for
+      # Access the underlying Dalli::Client or ConnectionPool instance for
       # access to get_multi, etc.
       def dalli
         @data
       end
 
+      def with(&block)
+        @data.with(&block)
+      end
+
       def fetch(name, options=nil)
         options ||= {}
-        name = expanded_key name
+        namespaced_name = namespaced_key(name, options)
 
         if block_given?
           unless options[:force]
-            entry = instrument(:read, name, options) do |payload|
-              read_entry(name, options).tap do |result|
+            entry = instrument(:read, namespaced_name, options) do |payload|
+              read_entry(namespaced_name, options).tap do |result|
                 if payload
                   payload[:super_operation] = :fetch
                   payload[:hit] = !!result
@@ -89,7 +114,7 @@ module ActiveSupport
 
       def read(name, options=nil)
         options ||= {}
-        name = expanded_key name
+        name = namespaced_key(name, options)
 
         instrument(:read, name, options) do |payload|
           entry = read_entry(name, options)
@@ -100,16 +125,19 @@ module ActiveSupport
 
       def write(name, value, options=nil)
         options ||= {}
-        name = expanded_key name
+        name = namespaced_key(name, options)
 
         instrument(:write, name, options) do |payload|
-          write_entry(name, value, options)
+          with do |connection|
+            options = options.merge(:connection => connection)
+            write_entry(name, value, options)
+          end
         end
       end
 
       def exist?(name, options=nil)
         options ||= {}
-        name = expanded_key name
+        name = namespaced_key(name, options)
 
         log(:exist, name, options)
         !read_entry(name, options).nil?
@@ -117,7 +145,7 @@ module ActiveSupport
 
       def delete(name, options=nil)
         options ||= {}
-        name = expanded_key name
+        name = namespaced_key(name, options)
 
         instrument(:delete, name, options) do |payload|
           delete_entry(name, options)
@@ -127,19 +155,20 @@ module ActiveSupport
       # Reads multiple keys from the cache using a single call to the
       # servers for all keys. Keys must be Strings.
       def read_multi(*names)
-        names.extract_options!
-        mapping = names.inject({}) { |memo, name| memo[expanded_key(name)] = name; memo }
+        options  = names.extract_options!
+        mapping = names.inject({}) { |memo, name| memo[namespaced_key(name, options)] = name; memo }
         instrument(:read_multi, names) do
           results = {}
           if local_cache
-            mapping.keys.each do |key|
+            mapping.each_key do |key|
               if value = local_cache.read_entry(key, options)
                 results[key] = value
               end
             end
           end
 
-          results.merge!(@data.get_multi(mapping.keys - results.keys))
+          data = with { |c| c.get_multi(mapping.keys - results.keys) }
+          results.merge!(data)
           results.inject({}) do |memo, (inner, _)|
             entry = results[inner]
             # NB Backwards data compatibility, to be removed at some point
@@ -157,21 +186,24 @@ module ActiveSupport
       # and the result will be written to the cache and returned.
       def fetch_multi(*names)
         options = names.extract_options!
-        mapping = names.inject({}) { |memo, name| memo[expanded_key(name)] = name; memo }
+        mapping = names.inject({}) { |memo, name| memo[namespaced_key(name, options)] = name; memo }
 
         instrument(:fetch_multi, names) do
-          results = @data.get_multi(mapping.keys)
+          with do |connection|
+            results = connection.get_multi(mapping.keys)
 
-          @data.multi do
-            mapping.inject({}) do |memo, (expanded, name)|
-              memo[name] = results[expanded]
-              if memo[name].nil?
-                value = yield(name)
-                memo[name] = value
-                write_entry(expanded, value, options)
+            connection.multi do
+              mapping.inject({}) do |memo, (expanded, name)|
+                memo[name] = results[expanded]
+                if memo[name].nil?
+                  value = yield(name)
+                  memo[name] = value
+                  options = options.merge(:connection => connection)
+                  write_entry(expanded, value, options)
+                end
+
+                memo
               end
-
-              memo
             end
           end
         end
@@ -184,15 +216,15 @@ module ActiveSupport
       # memcached counters cannot hold negative values.
       def increment(name, amount = 1, options=nil)
         options ||= {}
-        name = expanded_key name
+        name = namespaced_key(name, options)
         initial = options.has_key?(:initial) ? options[:initial] : amount
         expires_in = options[:expires_in]
         instrument(:increment, name, :amount => amount) do
-          @data.incr(name, amount, expires_in, initial)
+          with { |c| c.incr(name, amount, expires_in, initial) }
         end
       rescue Dalli::DalliError => e
         logger.error("DalliError: #{e.message}") if logger
-        raise if @raise_errors
+        raise if raise_errors?
         nil
       end
 
@@ -203,27 +235,33 @@ module ActiveSupport
       # memcached counters cannot hold negative values.
       def decrement(name, amount = 1, options=nil)
         options ||= {}
-        name = expanded_key name
+        name = namespaced_key(name, options)
         initial = options.has_key?(:initial) ? options[:initial] : 0
         expires_in = options[:expires_in]
         instrument(:decrement, name, :amount => amount) do
-          @data.decr(name, amount, expires_in, initial)
+          with { |c| c.decr(name, amount, expires_in, initial) }
         end
       rescue Dalli::DalliError => e
         logger.error("DalliError: #{e.message}") if logger
-        raise if @raise_errors
+        raise if raise_errors?
         nil
       end
 
       # Clear the entire cache on all memcached servers. This method should
-      # be used with care when using a shared cache.
+      # be used with care when using a shared cache. 
+      # Accepts an options hash with a :delay key. Delay is the number of seconds
+      # to delay the flush command. This number is compounded per memcached server.
+      # For example, with {:delay => 5} and three memcached servers, the first server
+      # will wait 5 seconds to flush it's keys, the second server will wait 10, third
+      # will wait 15, etc...
       def clear(options=nil)
         instrument(:clear, 'flushing all keys') do
-          @data.flush_all
+          delay = (options ? options[:delay] : 0) || 0
+          with { |c| c.flush_all(delay) }
         end
       rescue Dalli::DalliError => e
         logger.error("DalliError: #{e.message}") if logger
-        raise if @raise_errors
+        raise if raise_errors?
         nil
       end
 
@@ -233,11 +271,11 @@ module ActiveSupport
 
       # Get the statistics from the memcached servers.
       def stats
-        @data.stats
+        with { |c| c.stats }
       end
 
       def reset
-        @data.reset
+        with { |c| c.reset }
       end
 
       def logger
@@ -252,12 +290,12 @@ module ActiveSupport
 
       # Read an entry from the cache.
       def read_entry(key, options) # :nodoc:
-        entry = @data.get(key, options)
+        entry = with { |c| c.get(key, options) }
         # NB Backwards data compatibility, to be removed at some point
         entry.is_a?(ActiveSupport::Cache::Entry) ? entry.value : entry
       rescue Dalli::DalliError => e
         logger.error("DalliError: #{e.message}") if logger
-        raise if @raise_errors
+        raise if raise_errors?
         nil
       end
 
@@ -267,23 +305,33 @@ module ActiveSupport
         cleanup if options[:unless_exist]
         method = options[:unless_exist] ? :add : :set
         expires_in = options[:expires_in]
-        @data.send(method, key, value, expires_in, options)
+        connection = options.delete(:connection)
+        connection.send(method, key, value, expires_in, options)
       rescue Dalli::DalliError => e
         logger.error("DalliError: #{e.message}") if logger
-        raise if @raise_errors
+        raise if raise_errors?
         false
       end
 
       # Delete an entry from the cache.
       def delete_entry(key, options) # :nodoc:
-        @data.delete(key)
+        with { |c| c.delete(key) }
       rescue Dalli::DalliError => e
         logger.error("DalliError: #{e.message}") if logger
-        raise if @raise_errors
+        raise if raise_errors?
         false
       end
 
       private
+
+      def namespaced_key(key, options)
+        key = expanded_key(key)
+        namespace = options[:namespace] if options
+        prefix = namespace.is_a?(Proc) ? namespace.call : namespace
+        key = "#{prefix}:#{key}" if prefix
+        key
+      end
+
       # Expand key to be a consistent string value. Invoke +cache_key+ if
       # object responds to +cache_key+. Otherwise, to_param method will be
       # called. If the key is a Hash, then keys will be sorted alphabetically.
@@ -320,6 +368,10 @@ module ActiveSupport
       def log(operation, key, options=nil)
         return unless logger && logger.debug? && !silence?
         logger.debug("Cache #{operation}: #{key}#{options.blank? ? "" : " (#{options.inspect})"}")
+      end
+
+      def raise_errors?
+        !!@options[:raise_errors]
       end
     end
   end

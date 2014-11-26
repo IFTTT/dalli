@@ -1,17 +1,50 @@
 Dalli Changelog
 =====================
 
-Unreleased
+2.7.2
 ==========
+
+- The fix for #423 didn't make it into the released 2.7.1 gem somehow.
+
+2.7.1
+==========
+
+- Rack session will check if servers are up on initialization (arthurnn, #423)
+- Add support for IPv6 addresses in hex form, ie: "[::1]:11211" (dplummer, #428)
+- Add symbol support for namespace (jingkai #431)
+- Support expiration intervals longer than 30 days (leonid-shevtsov #436)
+
+2.7.0
+==========
+
+- BREAKING CHANGE:
+  Dalli::Client#add and #replace now return a truthy value, not boolean true or false.
+- Multithreading support with dalli\_store:
+  Use :pool\_size to create a pool of shared, threadsafe Dalli clients in Rails:
+```ruby
+    config.cache_store = :dalli_store, "cache-1.example.com", "cache-2.example.com", :compress => true, :pool_size => 5, :expires_in => 300
+```
+  This will ensure the Rails.cache singleton does not become a source of contention.
+  **PLEASE NOTE** Rails's :mem\_cache\_store does not support pooling as of
+Rails 4.0.  You must use :dalli\_store.
 
 - Implement `version` for retrieving version of connected servers [dterei, #384]
 - Implement `fetch_multi` for batched read/write [sorentwo, #380]
+- Add more support for safe updates with multiple writers: [philipmw, #395]
+  `require 'dalli/cas/client'` augments Dalli::Client with the following methods:
+  * Get value with CAS:            `[value, cas] = get_cas(key)`
+                                   `get_cas(key) {|value, cas| ...}`
+  * Get multiple values with CAS:  `get_multi_cas(k1, k2, ...) {|value, metadata| cas = metadata[:cas]}`
+  * Set value with CAS:            `new_cas = set_cas(key, value, cas, ttl, options)`
+  * Replace value with CAS:        `replace_cas(key, new_value, cas, ttl, options)`
+  * Delete value with CAS:         `delete_cas(key, cas)`
+- Fix bug with get key with "Not found" value [uzzz, #375]
 
 2.6.4
 =======
 
 - Fix ADD command, aka `write(unless_exist: true)` (pitr, #365)
-- Upgrade test suite from mini_shoulda to minitest.
+- Upgrade test suite from mini\_shoulda to minitest.
 - Even more performance improvements for get\_multi (xaop, #331)
 
 2.6.3

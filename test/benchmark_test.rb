@@ -10,7 +10,8 @@ describe 'performance' do
     @value = []
     @marshalled = Marshal.dump(@value)
 
-    @servers = ['127.0.0.1:19122', 'localhost:19122']
+    @port = 23417
+    @servers = ["127.0.0.1:#{@port}", "localhost:#{@port}"]
     @key1 = "Short"
     @key2 = "Sym1-2-3::45"*8
     @key3 = "Long"*40
@@ -21,8 +22,8 @@ describe 'performance' do
     @counter = 'counter'
   end
 
-  should 'run benchmarks' do
-    memcached do
+  it 'runs benchmarks' do
+    memcached(@port) do
 
       Benchmark.bm(37) do |x|
 

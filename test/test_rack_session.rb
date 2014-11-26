@@ -6,45 +6,56 @@ require 'rack/mock'
 require 'thread'
 
 describe Rack::Session::Dalli do
-  Rack::Session::Dalli::DEFAULT_OPTIONS[:memcache_server] = 'localhost:19129'
 
   before do
-    memcached(19129) do
+    @port = 19129
+    memcached_persistent(@port)
+    Rack::Session::Dalli::DEFAULT_OPTIONS[:memcache_server] = "localhost:#{@port}"
+
+    # test memcache connection
+    Rack::Session::Dalli.new(incrementor)
+  end
+
+  let(:session_key) { Rack::Session::Dalli::DEFAULT_OPTIONS[:key] }
+  let(:session_match) do
+    /#{session_key}=([0-9a-fA-F]+);/
+  end
+  let(:incrementor_proc) do
+    lambda do |env|
+      env["rack.session"]["counter"] ||= 0
+      env["rack.session"]["counter"] += 1
+      Rack::Response.new(env["rack.session"].inspect).to_a
     end
   end
-
-  session_key = Rack::Session::Dalli::DEFAULT_OPTIONS[:key]
-  session_match = /#{session_key}=([0-9a-fA-F]+);/
-  incrementor = lambda do |env|
-    env["rack.session"]["counter"] ||= 0
-    env["rack.session"]["counter"] += 1
-    Rack::Response.new(env["rack.session"].inspect).to_a
+  let(:drop_session) do
+    Rack::Lint.new(proc do |env|
+        env['rack.session.options'][:drop] = true
+        incrementor_proc.call(env)
+      end)
   end
-  drop_session = Rack::Lint.new(proc do |env|
-    env['rack.session.options'][:drop] = true
-    incrementor.call(env)
-  end)
-  renew_session = Rack::Lint.new(proc do |env|
-    env['rack.session.options'][:renew] = true
-    incrementor.call(env)
-  end)
-  defer_session = Rack::Lint.new(proc do |env|
-    env['rack.session.options'][:defer] = true
-    incrementor.call(env)
-  end)
-  skip_session = Rack::Lint.new(proc do |env|
-    env['rack.session.options'][:skip] = true
-    incrementor.call(env)
-  end)
-  incrementor = Rack::Lint.new(incrementor)
-
-  # test memcache connection
-  Rack::Session::Dalli.new(incrementor)
+  let(:renew_session) do
+    Rack::Lint.new(proc do |env|
+        env['rack.session.options'][:renew] = true
+        incrementor_proc.call(env)
+      end)
+  end
+  let(:defer_session) do
+    Rack::Lint.new(proc do |env|
+        env['rack.session.options'][:defer] = true
+        incrementor_proc.call(env)
+      end)
+  end
+  let(:skip_session) do
+    Rack::Lint.new(proc do |env|
+        env['rack.session.options'][:skip] = true
+        incrementor_proc.call(env)
+      end)
+  end
+  let(:incrementor) { Rack::Lint.new(incrementor_proc) }
 
   it "faults on no connection" do
     assert_raises Dalli::RingError do
-      rsd = Rack::Session::Dalli.new(incrementor, :memcache_server => 'nosuchserver')
-      rsd.pool.set('ping', '')
+      Rack::Session::Dalli.new(incrementor, :memcache_server => 'nosuchserver')
     end
   end
 
@@ -102,6 +113,15 @@ describe Rack::Session::Dalli do
     assert_equal '{"counter"=>1}', res.body
     cookie = res["Set-Cookie"][session_match]
     refute_match(/#{bad_cookie}/, cookie)
+  end
+
+  it "survives nonexistant blank cookies" do
+    bad_cookie = "rack.session="
+    rsd = Rack::Session::Dalli.new(incrementor)
+    res = Rack::MockRequest.new(rsd).
+      get("/", "HTTP_COOKIE" => bad_cookie)
+    cookie = res["Set-Cookie"][session_match]
+    refute_match(/#{bad_cookie}$/, cookie)
   end
 
   it "maintains freshness" do

@@ -31,17 +31,6 @@ module Dalli
       @ring = nil
     end
 
-    ##
-    # Normalizes the argument into an array of servers. If the argument is a string, it's expected to be of
-    # the format "memcache1.example.com:11211[,memcache2.example.com:11211[,memcache3.example.com:11211[...]]]
-    def normalize_servers(servers)
-      if servers.is_a? String
-        return servers.split(",")
-      else
-        return servers
-      end
-    end
-
     #
     # The standard memcached instruction set
     #
@@ -58,122 +47,22 @@ module Dalli
       Thread.current[:dalli_multi] = old
     end
 
+    ##
+    # Get the value associated with the key.
     def get(key, options=nil)
-      resp = perform(:get, key)
-      resp.nil? || 'Not found' == resp ? nil : resp
-    end
-
-    def groups_for_keys(*keys)
-      groups = mapped_keys(keys).flatten.group_by do |key|
-        begin
-          ring.server_for_key(key)
-        rescue Dalli::RingError
-          Dalli.logger.debug { "unable to get key #{key}" }
-          nil
-        end
-      end
-      return groups
-    end
-
-    def mapped_keys(keys)
-      keys.flatten.map {|a| validate_key(a.to_s)}
-    end
-
-    def make_multi_get_requests(groups)
-      groups.each do |server, keys_for_server|
-        begin
-          # TODO: do this with the perform chokepoint?
-          # But given the fact that fetching the response doesn't take place
-          # in that slot it's misleading anyway. Need to move all of this method
-          # into perform to be meaningful
-          server.request(:send_multiget, keys_for_server)
-        rescue DalliError, NetworkError => e
-          Dalli.logger.debug { e.inspect }
-          Dalli.logger.debug { "unable to get keys for server #{server.hostname}:#{server.port}" }
-        end
-      end
-    end
-
-    def perform_multi_response_start(servers)
-      servers.each do |server|
-        next unless server.alive?
-        begin
-          server.multi_response_start
-        rescue DalliError, NetworkError => e
-          Dalli.logger.debug { e.inspect }
-          Dalli.logger.debug { "results from this server will be missing" }
-          servers.delete(server)
-        end
-      end
-      servers
+      perform(:get, key)
     end
 
     ##
     # Fetch multiple keys efficiently.
-    # Returns a hash of { 'key' => 'value', 'key2' => 'value1' }
+    # If a block is given, yields key/value pairs one at a time.
+    # Otherwise returns a hash of { 'key' => 'value', 'key2' => 'value1' }
     def get_multi(*keys)
-      perform do
-        return {} if keys.empty?
-        options = nil
-        options = keys.pop if keys.last.is_a?(Hash) || keys.last.nil?
-        ring.lock do
-          begin
-            groups = groups_for_keys(keys)
-            if unfound_keys = groups.delete(nil)
-              Dalli.logger.debug { "unable to get keys for #{unfound_keys.length} keys because no matching server was found" }
-            end
-            make_multi_get_requests(groups)
-
-            servers = groups.keys
-            values = {}
-            return values if servers.empty?
-            servers = perform_multi_response_start(servers)
-
-            start = Time.now
-            loop do
-              # remove any dead servers
-              servers.delete_if { |s| s.sock.nil? }
-              break if servers.empty?
-
-              # calculate remaining timeout
-              elapsed = Time.now - start
-              timeout = servers.first.options[:socket_timeout]
-              if elapsed > timeout
-                readable = nil
-              else
-                sockets = servers.map(&:sock)
-                readable, _ = IO.select(sockets, nil, nil, timeout - elapsed)
-              end
-
-              if readable.nil?
-                # no response within timeout; abort pending connections
-                servers.each do |server|
-                  Dalli.logger.debug { "memcached at #{server.name} did not response within timeout" }
-                  server.multi_response_abort
-                end
-                break
-
-              else
-                readable.each do |sock|
-                  server = sock.server
-
-                  begin
-                    server.multi_response_nonblock.each do |key, value|
-                      values[key_without_namespace(key)] = value
-                    end
-
-                    if server.multi_response_completed?
-                      servers.delete(server)
-                    end
-                  rescue NetworkError
-                    servers.delete(server)
-                  end
-                end
-              end
-            end
-
-            values
-          end
+      if block_given?
+        get_multi_yielder(keys) {|k, data| yield k, data.first}
+      else
+         Hash.new.tap do |hash|
+          get_multi_yielder(keys) {|k, data| hash[k] = data.first}
         end
       end
     end
@@ -199,12 +88,12 @@ module Dalli
     # - nil if the key did not exist.
     # - false if the value was changed by someone else.
     # - true if the value was successfully updated.
-    def cas(key, ttl=nil, options=nil, &block)
+    def cas(key, ttl=nil, options=nil)
       ttl ||= @options[:expires_in].to_i
       (value, cas) = perform(:cas, key)
       value = (!value || value == 'Not found') ? nil : value
       if value
-        newvalue = block.call(value)
+        newvalue = yield(value)
         perform(:set, key, newvalue, ttl, cas, options)
       end
     end
@@ -216,7 +105,7 @@ module Dalli
 
     ##
     # Conditionally add a key/value pair, if the key does not already exist
-    # on the server.  Returns true if the operation succeeded.
+    # on the server.  Returns truthy if the operation succeeded.
     def add(key, value, ttl=nil, options=nil)
       ttl ||= @options[:expires_in].to_i
       perform(:add, key, value, ttl, options)
@@ -224,14 +113,14 @@ module Dalli
 
     ##
     # Conditionally add a key/value pair, only if the key already exists
-    # on the server.  Returns true if the operation succeeded.
+    # on the server.  Returns truthy if the operation succeeded.
     def replace(key, value, ttl=nil, options=nil)
       ttl ||= @options[:expires_in].to_i
-      perform(:replace, key, value, ttl, options)
+      perform(:replace, key, value, ttl, 0, options)
     end
 
     def delete(key)
-      perform(:delete, key)
+      perform(:delete, key, 0)
     end
 
     ##
@@ -248,8 +137,12 @@ module Dalli
       perform(:prepend, key, value.to_s)
     end
 
+    ##
+    # Flush all keys in the memcached servers.
+    # Accepts an optional delay (in seconds). Delay is incremented per server
+    # so total time to flush all servers is number of servers * seconds of delay.
     def flush(delay=0)
-      time = -delay
+      time = 0 
       ring.servers.map { |s| s.request(:flush, time += delay) }
     end
 
@@ -304,10 +197,10 @@ module Dalli
 
     ##
     # Collect the stats for each server.
-    # You can optionally pass a type including :items or :slabs to get specific stats
+    # You can optionally pass a type including :items, :slabs or :settings to get specific stats
     # Returns a hash like { 'hostname:port' => { 'stat1' => 'value1', ... }, 'hostname2:port' => { ... } }
     def stats(type=nil)
-      type = nil if ![nil, :items,:slabs].include? type
+      type = nil if ![nil, :items,:slabs,:settings].include? type
       values = {}
       ring.servers.each do |server|
         values["#{server.hostname}:#{server.port}"] = server.alive? ? server.request(:stats,type.to_s) : nil
@@ -321,6 +214,12 @@ module Dalli
       ring.servers.map do |server|
         server.alive? ? server.request(:reset_stats) : nil
       end
+    end
+
+    ##
+    ## Make sure memcache servers are alive, or raise an Dalli::RingError
+    def alive!
+      ring.server_for_key("")
     end
 
     ##
@@ -344,7 +243,68 @@ module Dalli
     end
     alias_method :reset, :close
 
+    # Stub method so a bare Dalli client can pretend to be a connection pool.
+    def with
+      yield self
+    end
+
     private
+
+    def groups_for_keys(*keys)
+      groups = mapped_keys(keys).flatten.group_by do |key|
+        begin
+          ring.server_for_key(key)
+        rescue Dalli::RingError
+          Dalli.logger.debug { "unable to get key #{key}" }
+          nil
+        end
+      end
+      return groups
+    end
+
+    def mapped_keys(keys)
+      keys.flatten.map {|a| validate_key(a.to_s)}
+    end
+
+    def make_multi_get_requests(groups)
+      groups.each do |server, keys_for_server|
+        begin
+          # TODO: do this with the perform chokepoint?
+          # But given the fact that fetching the response doesn't take place
+          # in that slot it's misleading anyway. Need to move all of this method
+          # into perform to be meaningful
+          server.request(:send_multiget, keys_for_server)
+        rescue DalliError, NetworkError => e
+          Dalli.logger.debug { e.inspect }
+          Dalli.logger.debug { "unable to get keys for server #{server.hostname}:#{server.port}" }
+        end
+      end
+    end
+
+    def perform_multi_response_start(servers)
+      servers.each do |server|
+        next unless server.alive?
+        begin
+          server.multi_response_start
+        rescue DalliError, NetworkError => e
+          Dalli.logger.debug { e.inspect }
+          Dalli.logger.debug { "results from this server will be missing" }
+          servers.delete(server)
+        end
+      end
+      servers
+    end
+
+    ##
+    # Normalizes the argument into an array of servers. If the argument is a string, it's expected to be of
+    # the format "memcache1.example.com:11211[,memcache2.example.com:11211[,memcache3.example.com:11211[...]]]
+    def normalize_servers(servers)
+      if servers.is_a? String
+        return servers.split(",")
+      else
+        return servers
+      end
+    end
 
     def ring
       @ring ||= Dalli::Ring.new(
@@ -398,7 +358,8 @@ module Dalli
     end
 
     def namespace
-      @options[:namespace].is_a?(Proc) ? @options[:namespace].call : @options[:namespace]
+      return nil unless @options[:namespace]
+      @options[:namespace].is_a?(Proc) ? @options[:namespace].call.to_s : @options[:namespace].to_s
     end
 
     def normalize_options(opts)
@@ -413,5 +374,70 @@ module Dalli
       end
       opts
     end
+
+    ##
+    # Yields, one at a time, keys and their values+attributes.
+    def get_multi_yielder(keys)
+      perform do
+        return {} if keys.empty?
+        ring.lock do
+          begin
+            groups = groups_for_keys(keys)
+            if unfound_keys = groups.delete(nil)
+              Dalli.logger.debug { "unable to get keys for #{unfound_keys.length} keys because no matching server was found" }
+            end
+            make_multi_get_requests(groups)
+
+            servers = groups.keys
+            return if servers.empty?
+            servers = perform_multi_response_start(servers)
+
+            start = Time.now
+            loop do
+              # remove any dead servers
+              servers.delete_if { |s| s.sock.nil? }
+              break if servers.empty?
+
+              # calculate remaining timeout
+              elapsed = Time.now - start
+              timeout = servers.first.options[:socket_timeout]
+              if elapsed > timeout
+                readable = nil
+              else
+                sockets = servers.map(&:sock)
+                readable, _ = IO.select(sockets, nil, nil, timeout - elapsed)
+              end
+
+              if readable.nil?
+                # no response within timeout; abort pending connections
+                servers.each do |server|
+                  Dalli.logger.debug { "memcached at #{server.name} did not response within timeout" }
+                  server.multi_response_abort
+                end
+                break
+
+              else
+                readable.each do |sock|
+                  server = sock.server
+
+                  begin
+                    server.multi_response_nonblock.each_pair do |key, value_list|
+                      yield key_without_namespace(key), value_list
+                    end
+
+                    if server.multi_response_completed?
+                      servers.delete(server)
+                    end
+                  rescue NetworkError
+                    servers.delete(server)
+                  end
+                end
+              end
+            end
+          end
+        end
+      end
+    end
+
   end
 end
